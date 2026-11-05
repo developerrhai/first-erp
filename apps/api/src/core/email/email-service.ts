@@ -262,10 +262,90 @@ type SendEmail = {
   (department: EmailDepartment, message: EmailMessage): Promise<EmailSubmissionResult>;
 };
 
-function logEmailFailure(operation: 'send' | 'verify', category: EmailServiceErrorCategory): void {
+type SafeSmtpDiagnostics = {
+  smtpResponseCode?: number;
+  smtpCommand?: string;
+  nodemailerErrorCode?: string;
+  acceptedRecipientCount?: number;
+  rejectedRecipientCount?: number;
+  rejectedErrorCount?: number;
+  pendingRecipientCount?: number;
+  hasPendingRecipients?: boolean;
+  allRequestedRecipientsAccepted?: boolean;
+  senderMatchesAuthenticatedUser?: boolean;
+};
+
+const SAFE_SMTP_COMMANDS = [
+  'AUTH',
+  'CONN',
+  'DATA',
+  'EHLO',
+  'HELO',
+  'MAIL FROM',
+  'QUIT',
+  'RCPT TO',
+  'STARTTLS',
+] as const;
+
+function logEmailFailure(
+  operation: 'send' | 'verify',
+  category: EmailServiceErrorCategory,
+  diagnostics: SafeSmtpDiagnostics = {},
+): void {
   logger.warn(
-    { emailOperation: operation, emailErrorCategory: category },
+    {
+      emailOperation: operation,
+      emailErrorCategory: category,
+      ...diagnostics,
+    },
     'Email operation failed',
+  );
+}
+
+function getSafeSmtpDiagnostics(error: unknown): SafeSmtpDiagnostics {
+  if (typeof error !== 'object' || error === null) return {};
+  const details = error as {
+    code?: unknown;
+    command?: unknown;
+    responseCode?: unknown;
+    accepted?: unknown;
+    rejected?: unknown;
+    pending?: unknown;
+  };
+  const diagnostics: SafeSmtpDiagnostics = {};
+  if (
+    typeof details.responseCode === 'number' &&
+    Number.isInteger(details.responseCode) &&
+    details.responseCode >= 100 &&
+    details.responseCode <= 599
+  ) {
+    diagnostics.smtpResponseCode = details.responseCode;
+  }
+  if (typeof details.command === 'string') {
+    const command = details.command.trim().toUpperCase();
+    diagnostics.smtpCommand = SAFE_SMTP_COMMANDS.find(
+      (safeCommand) => command === safeCommand || command.startsWith(`${safeCommand}:`),
+    );
+  }
+  if (typeof details.code === 'string' && /^[A-Z0-9_-]{1,32}$/i.test(details.code)) {
+    diagnostics.nodemailerErrorCode = details.code.toUpperCase();
+  }
+  if (Array.isArray(details.accepted)) {
+    diagnostics.acceptedRecipientCount = details.accepted.length;
+  }
+  if (Array.isArray(details.rejected)) {
+    diagnostics.rejectedRecipientCount = details.rejected.length;
+  }
+  if (Array.isArray(details.pending)) {
+    diagnostics.pendingRecipientCount = details.pending.length;
+  }
+  return diagnostics;
+}
+
+function senderMatchesAuthenticatedUser(sender: string, config: SmtpConfiguration): boolean {
+  return (
+    typeof config.SMTP_USER === 'string' &&
+    sender.trim().toLowerCase() === config.SMTP_USER.trim().toLowerCase()
   );
 }
 
@@ -302,6 +382,7 @@ function getRecipientAddress(recipient: unknown): string | undefined {
 export function assertEmailSubmissionAccepted(
   result: EmailSubmissionResult,
   recipients?: Pick<EmailMessage, 'to' | 'cc' | 'bcc'>,
+  diagnostics: Pick<SafeSmtpDiagnostics, 'senderMatchesAuthenticatedUser'> = {},
 ): EmailSubmissionResult {
   const acceptedAddresses = new Set(
     (Array.isArray(result?.accepted) ? result.accepted : [])
@@ -314,19 +395,31 @@ export function assertEmailSubmissionAccepted(
         .flatMap((value) => (value === undefined ? [] : Array.isArray(value) ? value : [value]))
         .map((address) => address.toLowerCase())
     : [];
-  const missingRecipientAcceptance = requestedAddresses.some(
-    (address) => !acceptedAddresses.has(address),
+  const allRequestedRecipientsAccepted = requestedAddresses.every((address) =>
+    acceptedAddresses.has(address),
   );
+  // Nodemailer's SMTP transport omits `pending`; that field is only populated by other transports.
+  const pendingRecipients = Array.isArray(result?.pending) ? result.pending : [];
   if (
     !Array.isArray(result?.accepted) ||
     !Array.isArray(result.rejected) ||
-    !Array.isArray(result.pending) ||
     result.accepted.length === 0 ||
     result.rejected.length > 0 ||
-    result.pending.length > 0 ||
-    missingRecipientAcceptance
+    pendingRecipients.length > 0 ||
+    !allRequestedRecipientsAccepted
   ) {
-    logEmailFailure('send', 'provider_rejection');
+    const rejectedErrors = Array.isArray(result?.rejectedErrors) ? result.rejectedErrors : [];
+    const firstRejectedError = rejectedErrors[0];
+    logEmailFailure('send', 'provider_rejection', {
+      ...(firstRejectedError ? getSafeSmtpDiagnostics(firstRejectedError) : {}),
+      acceptedRecipientCount: Array.isArray(result?.accepted) ? result.accepted.length : undefined,
+      rejectedRecipientCount: Array.isArray(result?.rejected) ? result.rejected.length : undefined,
+      rejectedErrorCount: rejectedErrors.length,
+      pendingRecipientCount: pendingRecipients.length,
+      hasPendingRecipients: pendingRecipients.length > 0,
+      allRequestedRecipientsAccepted,
+      ...diagnostics,
+    });
     throw new EmailServiceError('provider_rejection', 'SMTP email delivery failed.');
   }
   return result;
@@ -432,10 +525,15 @@ export function createEmailService(
       result = await transport.sendMail({ ...validatedMessage, from });
     } catch (error) {
       const category = classifyTransportError(error);
-      logEmailFailure('send', category);
+      logEmailFailure('send', category, {
+        ...getSafeSmtpDiagnostics(error),
+        senderMatchesAuthenticatedUser: senderMatchesAuthenticatedUser(from, config),
+      });
       throw new EmailServiceError(category, 'SMTP email delivery failed.');
     }
-    return assertEmailSubmissionAccepted(result, validatedMessage);
+    return assertEmailSubmissionAccepted(result, validatedMessage, {
+      senderMatchesAuthenticatedUser: senderMatchesAuthenticatedUser(from, config),
+    });
   }
 
   const sendEmail: SendEmail = async (
@@ -482,7 +580,7 @@ export function createEmailService(
         return await transport.verify();
       } catch (error) {
         const category = classifyTransportError(error);
-        logEmailFailure('verify', category);
+        logEmailFailure('verify', category, getSafeSmtpDiagnostics(error));
         throw new EmailServiceError(
           category,
           'SMTP connection verification failed. Check SMTP settings and connectivity.',

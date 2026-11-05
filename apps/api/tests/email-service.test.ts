@@ -257,6 +257,29 @@ describe('email service', () => {
     }
   });
 
+  it('accepts a Nodemailer SMTP result that omits its optional pending field', async () => {
+    const result = {
+      ...sentMessageInfo,
+      accepted: ['recipient@example.invalid'],
+      rejected: [],
+    };
+    Reflect.deleteProperty(result, 'pending');
+    const sendMail = vi.fn().mockResolvedValue(result);
+    const service = createEmailService(smtpConfig, () => ({
+      sendMail,
+      verify: vi.fn().mockResolvedValue(true as const),
+    }));
+
+    await expect(
+      service.sendEmail('Administration', {
+        to: 'recipient@example.invalid',
+        subject: 'Notice',
+        text: 'Body',
+      }),
+    ).resolves.toEqual(result);
+    expect(sendMail).toHaveBeenCalledOnce();
+  });
+
   it('categorizes and safely logs authentication and connection failures', async () => {
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     try {
@@ -303,17 +326,34 @@ describe('email service', () => {
 
       expect(warn).toHaveBeenNthCalledWith(
         1,
-        { emailOperation: 'send', emailErrorCategory: 'authentication' },
+        expect.objectContaining({
+          emailOperation: 'send',
+          emailErrorCategory: 'authentication',
+          nodemailerErrorCode: 'EAUTH',
+          smtpCommand: 'AUTH',
+          smtpResponseCode: 535,
+          senderMatchesAuthenticatedUser: false,
+        }),
         'Email operation failed',
       );
       expect(warn).toHaveBeenNthCalledWith(
         2,
-        { emailOperation: 'send', emailErrorCategory: 'connection' },
+        expect.objectContaining({
+          emailOperation: 'send',
+          emailErrorCategory: 'connection',
+          nodemailerErrorCode: 'ECONNECTION',
+          senderMatchesAuthenticatedUser: false,
+        }),
         'Email operation failed',
       );
       expect(warn).toHaveBeenNthCalledWith(
         3,
-        { emailOperation: 'send', emailErrorCategory: 'provider_rejection' },
+        expect.objectContaining({
+          emailOperation: 'send',
+          emailErrorCategory: 'provider_rejection',
+          smtpResponseCode: 550,
+          senderMatchesAuthenticatedUser: false,
+        }),
         'Email operation failed',
       );
 
@@ -337,6 +377,150 @@ describe('email service', () => {
       );
       expect(JSON.stringify(warn.mock.calls)).not.toContain('private');
       expect(JSON.stringify(warn.mock.calls)).not.toContain('recipient@example.invalid');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs only safe SMTP rejection fields and counts for returned recipient results', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const gmailSender = 'gmail-test-mailbox@gmail.com';
+    const service = createEmailService(
+      { ...smtpConfig, SMTP_USER: gmailSender, EMAIL_FROM_ADMINISTRATION: gmailSender },
+      () => ({
+        sendMail: vi.fn().mockResolvedValue({
+          ...sentMessageInfo,
+          accepted: ['accepted@example.invalid'],
+          rejected: ['private-recipient@example.invalid'],
+          rejectedErrors: [
+            Object.assign(new Error('550 5.1.1 private-recipient@example.invalid rejected'), {
+              code: 'EENVELOPE',
+              command: 'RCPT TO:<private-recipient@example.invalid>',
+              responseCode: 550,
+              response: '550 5.1.1 private-recipient@example.invalid rejected',
+            }),
+          ],
+          response: '250 2.0.0 Message accepted',
+        }),
+        verify: vi.fn().mockResolvedValue(true as const),
+      }),
+    );
+
+    try {
+      await expect(
+        service.sendEmail('Administration', {
+          to: ['accepted@example.invalid', 'private-recipient@example.invalid'],
+          subject: 'Notice',
+          text: 'Body',
+        }),
+      ).rejects.toMatchObject({ category: 'provider_rejection' });
+
+      expect(warn).toHaveBeenCalledWith(
+        {
+          emailOperation: 'send',
+          emailErrorCategory: 'provider_rejection',
+          smtpResponseCode: 550,
+          smtpCommand: 'RCPT TO',
+          nodemailerErrorCode: 'EENVELOPE',
+          acceptedRecipientCount: 1,
+          rejectedRecipientCount: 1,
+          rejectedErrorCount: 1,
+          pendingRecipientCount: 0,
+          hasPendingRecipients: false,
+          allRequestedRecipientsAccepted: false,
+          senderMatchesAuthenticatedUser: true,
+        },
+        'Email operation failed',
+      );
+      const loggedFields = JSON.stringify(warn.mock.calls);
+      expect(loggedFields).not.toContain('private-recipient@example.invalid');
+      expect(loggedFields).not.toContain('gmail-test-mailbox@gmail.com');
+      expect(loggedFields).not.toContain('5.1.1');
+      expect(loggedFields).not.toContain('private');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('logs only a boolean when an accepted address does not match the requested recipient', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const service = createEmailService(smtpConfig, () => ({
+      sendMail: vi.fn().mockResolvedValue({
+        ...sentMessageInfo,
+        accepted: ['different@example.invalid'],
+        rejected: [],
+        pending: [],
+      }),
+      verify: vi.fn().mockResolvedValue(true as const),
+    }));
+
+    try {
+      await expect(
+        service.sendEmail('Administration', {
+          to: 'requested@example.invalid',
+          subject: 'Notice',
+          text: 'Body',
+        }),
+      ).rejects.toMatchObject({ category: 'provider_rejection' });
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailErrorCategory: 'provider_rejection',
+          acceptedRecipientCount: 1,
+          rejectedRecipientCount: 0,
+          pendingRecipientCount: 0,
+          hasPendingRecipients: false,
+          allRequestedRecipientsAccepted: false,
+        }),
+        'Email operation failed',
+      );
+      const loggedFields = JSON.stringify(warn.mock.calls);
+      expect(loggedFields).not.toContain('different@example.invalid');
+      expect(loggedFields).not.toContain('requested@example.invalid');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('sanitizes SMTP command details while logging Nodemailer rejection codes', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const error = Object.assign(new Error('550 5.1.1 rejected private-recipient@example.invalid'), {
+      code: 'EENVELOPE',
+      command: 'RCPT TO:<private-recipient@example.invalid>',
+      responseCode: 550,
+      response: '550 5.1.1 rejected private-recipient@example.invalid',
+      rejected: ['private-recipient@example.invalid'],
+    });
+    const service = createEmailService(smtpConfig, () => ({
+      sendMail: vi.fn().mockRejectedValue(error),
+      verify: vi.fn().mockResolvedValue(true as const),
+    }));
+
+    try {
+      await expect(
+        service.sendEmail('Administration', {
+          to: 'private-recipient@example.invalid',
+          subject: 'Notice',
+          text: 'Body',
+        }),
+      ).rejects.toMatchObject({ category: 'provider_rejection' });
+
+      expect(warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          emailOperation: 'send',
+          emailErrorCategory: 'provider_rejection',
+          smtpResponseCode: 550,
+          smtpCommand: 'RCPT TO',
+          nodemailerErrorCode: 'EENVELOPE',
+          rejectedRecipientCount: 1,
+          senderMatchesAuthenticatedUser: false,
+        }),
+        'Email operation failed',
+      );
+      const loggedFields = JSON.stringify(warn.mock.calls);
+      expect(loggedFields).not.toContain('private-recipient@example.invalid');
+      expect(loggedFields).not.toContain('5.1.1');
+      expect(loggedFields).not.toContain('private');
     } finally {
       warn.mockRestore();
     }
