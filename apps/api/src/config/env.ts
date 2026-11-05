@@ -1,10 +1,16 @@
 // Reads and validates every environment variable once, so a misconfigured server fails fast at boot
 // instead of misbehaving later. Everything else imports the typed `env` object from here.
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+const envFilePath = [
+  path.resolve(process.cwd(), 'apps', 'api', '.env'),
+  path.resolve(process.cwd(), '.env'),
+].find(existsSync);
+
+if (envFilePath) dotenv.config({ path: envFilePath });
 
 const DURATION = /^(\d+)(s|m|h)$/;
 const UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600 };

@@ -1,5 +1,8 @@
 import type { Request, Response } from 'express';
-import { sendEmailForAuthenticatedUser } from '../../core/email/email-service';
+import {
+  assertEmailSubmissionAccepted,
+  sendEmailForAuthenticatedUser,
+} from '../../core/email/email-service';
 import { requireAuth } from '../../core/auth/auth-context';
 import { AppError, Errors } from '../../core/http/errors';
 import { validated } from '../../core/http/validate';
@@ -36,7 +39,8 @@ export const emailController = {
     async (req: Request, res: Response): Promise<void> => {
       const message = validated(res, 'body', emailSendBodySchema);
       try {
-        await send(requireAuth(req).user, message);
+        const result = await send(requireAuth(req).user, message);
+        assertEmailSubmissionAccepted(result, message);
       } catch (error) {
         throw mapEmailError(error);
       }

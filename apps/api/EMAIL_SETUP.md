@@ -138,6 +138,36 @@ ready examples. All transport tests use a mock and do not send email. Do not use
 `verifySmtpConnection` in automated tests or local development unless company IT has provided
 authorized configuration and you explicitly intend to make a real network connection.
 
+### Local Gmail test commands
+
+The ignored `apps/api/.env` may hold a separate local Gmail test profile. Its Gmail SMTP values are
+commented placeholders; set them locally before running these commands. The profile uses
+`EMAIL_FROM_ADMINISTRATION` for the temporary test sender only and does not change tracked sender
+profiles. The SMTP username and sender should be your Gmail address; use a Google App Password only
+if Google account policy permits it. Do not copy the App Password into `.env.example` or source.
+
+From the repository root, verify SMTP connectivity without sending an email:
+
+```powershell
+npm --prefix apps/api run email:verify
+```
+
+This command calls `verifySmtpConnection('Administration')` only. It may connect to Gmail to
+authenticate, but never calls `sendEmail()`.
+
+To explicitly send one test message to a recipient you provide:
+
+```powershell
+npm --prefix apps/api run email:test -- recipient@example.com
+```
+
+This command requires exactly one valid recipient address and calls
+`sendEmail('Administration', message)`. It sends only when this separate command is invoked; it
+does not run as part of verification or the test suite. Both scripts print only a generic result or
+safe error category, not credentials, raw provider errors, or recipient addresses. The scripts also
+require `DATABASE_URL` and `JWT_ACCESS_SECRET` because the existing API environment schema validates
+them when the central service is imported; they do not connect to the database.
+
 ## Send an email
 
 Trusted backend code may import the stable `sendEmail()` function from
@@ -266,6 +296,11 @@ the SMTP server accepted the submission; it does not confirm delivery to the rec
 was read. Validation errors use the API's standard 422 response, missing permission returns 403,
 and missing sender/SMTP configuration or send failure returns a sanitized 503 response. SMTP error
 details and message data are not included in the response.
+
+The service checks Nodemailer's `accepted`, `rejected`, and `pending` recipient results. It returns
+success only when all requested recipients are accepted. Partial rejection, total rejection, or a
+pending recipient uses the existing sanitized 503 response; SMTP may already have accepted some
+recipients in a partial outcome, so callers should not retry automatically.
 
 ### Assigning `email.send`
 

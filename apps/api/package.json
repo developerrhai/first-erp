@@ -16,6 +16,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:email": "vitest run --config vitest.email.config.mts",
+    "email:verify": "tsx scripts/email-verify.ts",
+    "email:test": "tsx scripts/email-test.ts",
     "verify": "npm run lint && npm run typecheck && npm run test",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",

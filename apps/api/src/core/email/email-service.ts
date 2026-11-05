@@ -5,6 +5,7 @@ import { z } from 'zod';
 import type { User } from '@prisma/client';
 import { EMAIL_SENDER_CONFIG_KEYS, env, isValidSmtpHost } from '../../config/env';
 import type { EmailDepartment } from '../../config/env';
+import { logger } from '../logger';
 
 type EmailSenderConfigKey = (typeof EMAIL_SENDER_CONFIG_KEYS)[EmailDepartment];
 type SmtpConfiguration = Pick<
@@ -96,6 +97,24 @@ export type DepartmentEmailRequest = {
   attachments?: EmailMessage['attachments'];
 };
 export type EmailSubmissionResult = SMTPTransport.SentMessageInfo;
+
+export type EmailServiceErrorCategory =
+  | 'configuration'
+  | 'authentication'
+  | 'connection'
+  | 'provider_rejection'
+  | 'invalid_message'
+  | 'authorization';
+
+export class EmailServiceError extends Error {
+  constructor(
+    readonly category: EmailServiceErrorCategory,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'EmailServiceError';
+  }
+}
 
 export type SmtpConfigurationStatus = 'disabled' | 'incomplete' | 'invalid' | 'ready';
 export type SmtpConfigurationDiagnostics = {
@@ -243,6 +262,76 @@ type SendEmail = {
   (department: EmailDepartment, message: EmailMessage): Promise<EmailSubmissionResult>;
 };
 
+function logEmailFailure(operation: 'send' | 'verify', category: EmailServiceErrorCategory): void {
+  logger.warn(
+    { emailOperation: operation, emailErrorCategory: category },
+    'Email operation failed',
+  );
+}
+
+function classifyTransportError(
+  error: unknown,
+): 'authentication' | 'connection' | 'provider_rejection' {
+  if (typeof error !== 'object' || error === null) return 'connection';
+  const details = error as { code?: unknown; command?: unknown; responseCode?: unknown };
+  const code = typeof details.code === 'string' ? details.code.toUpperCase() : '';
+  const command = typeof details.command === 'string' ? details.command.toUpperCase() : '';
+  const responseCode = typeof details.responseCode === 'number' ? details.responseCode : undefined;
+
+  if (
+    command === 'AUTH' ||
+    ['EAUTH', 'EAUTHFAILED', 'ELOGIN'].includes(code) ||
+    responseCode === 530 ||
+    responseCode === 534 ||
+    responseCode === 535
+  ) {
+    return 'authentication';
+  }
+  if (responseCode !== undefined && responseCode >= 400) return 'provider_rejection';
+  return 'connection';
+}
+
+function getRecipientAddress(recipient: unknown): string | undefined {
+  if (typeof recipient === 'string') return recipient;
+  if (typeof recipient !== 'object' || recipient === null || !('address' in recipient)) {
+    return undefined;
+  }
+  return typeof recipient.address === 'string' ? recipient.address : undefined;
+}
+
+export function assertEmailSubmissionAccepted(
+  result: EmailSubmissionResult,
+  recipients?: Pick<EmailMessage, 'to' | 'cc' | 'bcc'>,
+): EmailSubmissionResult {
+  const acceptedAddresses = new Set(
+    (Array.isArray(result?.accepted) ? result.accepted : [])
+      .map(getRecipientAddress)
+      .filter((address): address is string => typeof address === 'string')
+      .map((address) => address.toLowerCase()),
+  );
+  const requestedAddresses = recipients
+    ? [recipients.to, recipients.cc, recipients.bcc]
+        .flatMap((value) => (value === undefined ? [] : Array.isArray(value) ? value : [value]))
+        .map((address) => address.toLowerCase())
+    : [];
+  const missingRecipientAcceptance = requestedAddresses.some(
+    (address) => !acceptedAddresses.has(address),
+  );
+  if (
+    !Array.isArray(result?.accepted) ||
+    !Array.isArray(result.rejected) ||
+    !Array.isArray(result.pending) ||
+    result.accepted.length === 0 ||
+    result.rejected.length > 0 ||
+    result.pending.length > 0 ||
+    missingRecipientAcceptance
+  ) {
+    logEmailFailure('send', 'provider_rejection');
+    throw new EmailServiceError('provider_rejection', 'SMTP email delivery failed.');
+  }
+  return result;
+}
+
 export function createEmailService(
   config: SmtpConfiguration,
   transportFactory?: TransportFactory,
@@ -261,36 +350,55 @@ export function createEmailService(
   function validateMessage(message: EmailMessage): EmailMessage {
     const result = emailMessageSchema.safeParse(message);
     if (!result.success) {
-      throw new Error(
+      throw new EmailServiceError(
+        'invalid_message',
         'Invalid email message. Check recipients, subject, content, and attachments.',
       );
     }
     return result.data;
   }
 
-  function getSender(departmentName: string): string {
+  function getSender(departmentName: string, operation: 'send' | 'verify' = 'send'): string {
     const department = normalizeEmailDepartment(departmentName);
     if (!department) {
-      throw new Error('Email sender is not configured for the requested department.');
+      logEmailFailure(operation, 'configuration');
+      throw new EmailServiceError(
+        'configuration',
+        'Email sender is not configured for the requested department.',
+      );
     }
     const senderKey = EMAIL_SENDER_CONFIG_KEYS[department];
     const sender = config[senderKey];
     if (!sender || !z.string().email().safeParse(sender).success) {
-      throw new Error(`Email sender is not configured for department ${department}.`);
+      logEmailFailure(operation, 'configuration');
+      throw new EmailServiceError(
+        'configuration',
+        `Email sender is not configured for department ${department}.`,
+      );
     }
     return sender;
   }
 
-  function getTransporter(): MailTransport {
+  function getTransporter(operation: 'send' | 'verify' = 'send'): MailTransport {
     const diagnostics = diagnoseSmtpConfiguration(config);
     if (diagnostics.status === 'disabled') {
-      throw new Error('Email service is not configured. Set SMTP_HOST.');
+      logEmailFailure(operation, 'configuration');
+      throw new EmailServiceError(
+        'configuration',
+        'Email service is not configured. Set SMTP_HOST.',
+      );
     }
     if (!config.SMTP_HOST && smtpSettingKeys.every((key) => config[key] === undefined)) {
-      throw new Error('Email service is not configured. Set SMTP_HOST.');
+      logEmailFailure(operation, 'configuration');
+      throw new EmailServiceError(
+        'configuration',
+        'Email service is not configured. Set SMTP_HOST.',
+      );
     }
     if (diagnostics.status !== 'ready') {
-      throw new Error(
+      logEmailFailure(operation, 'configuration');
+      throw new EmailServiceError(
+        'configuration',
         `Email service configuration ${diagnostics.status}: ${diagnostics.issues.join('; ')}.`,
       );
     }
@@ -319,11 +427,15 @@ export function createEmailService(
     const from = getSender(department);
     const validatedMessage = validateMessage(message);
     const transport = getTransporter();
+    let result: EmailSubmissionResult;
     try {
-      return await transport.sendMail({ ...validatedMessage, from });
-    } catch {
-      throw new Error('SMTP email delivery failed.');
+      result = await transport.sendMail({ ...validatedMessage, from });
+    } catch (error) {
+      const category = classifyTransportError(error);
+      logEmailFailure('send', category);
+      throw new EmailServiceError(category, 'SMTP email delivery failed.');
     }
+    return assertEmailSubmissionAccepted(result, validatedMessage);
   }
 
   const sendEmail: SendEmail = async (
@@ -349,21 +461,30 @@ export function createEmailService(
     sendEmail,
     async sendEmailForAuthenticatedUser(user, message) {
       if (user.status !== 'ACTIVE') {
-        throw new Error('Email sending is not available to inactive users.');
+        throw new EmailServiceError(
+          'authorization',
+          'Email sending is not available to inactive users.',
+        );
       }
       const department = user.department ? normalizeEmailDepartment(user.department) : undefined;
       if (!department) {
-        throw new Error('Email sender is not configured for the authenticated user department.');
+        throw new EmailServiceError(
+          'configuration',
+          'Email sender is not configured for the authenticated user department.',
+        );
       }
       return sendForDepartment(department, message);
     },
     async verifySmtpConnection(department) {
-      getSender(department);
-      const transport = getTransporter();
+      getSender(department, 'verify');
+      const transport = getTransporter('verify');
       try {
         return await transport.verify();
-      } catch {
-        throw new Error(
+      } catch (error) {
+        const category = classifyTransportError(error);
+        logEmailFailure('verify', category);
+        throw new EmailServiceError(
+          category,
           'SMTP connection verification failed. Check SMTP settings and connectivity.',
         );
       }

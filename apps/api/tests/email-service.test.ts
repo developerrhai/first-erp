@@ -8,8 +8,9 @@ import {
   diagnoseSmtpConfiguration,
   normalizeEmailDepartment,
 } from '../src/core/email/email-service';
-import { createLogger } from '../src/core/logger';
 import { emailTemplateDrafts } from '../src/core/email/email-templates';
+import { EmailServiceError } from '../src/core/email/email-service';
+import { createLogger, logger } from '../src/core/logger';
 import { EMAIL_TEST_ENV } from './email-setup-env';
 
 const senderAddresses: Record<EmailDepartment, string> = {
@@ -144,7 +145,14 @@ describe('email service', () => {
   const sentMessageInfo: SMTPTransport.SentMessageInfo = {
     envelope: { from: senderAddresses.Administration, to: ['recipient@example.invalid'] },
     messageId: 'message-id',
-    accepted: ['recipient@example.invalid'],
+    accepted: [
+      'recipient@example.invalid',
+      'other@example.invalid',
+      'to@example.invalid',
+      'cc@example.invalid',
+      'bcc1@example.invalid',
+      'bcc2@example.invalid',
+    ],
     rejected: [],
     pending: [],
     response: '250 Message accepted',
@@ -195,6 +203,143 @@ describe('email service', () => {
     await expect(service.verifySmtpConnection('Administration')).resolves.toBe(true);
     expect(transportFactory).toHaveBeenCalledTimes(1);
     expect(verify).toHaveBeenCalledOnce();
+  });
+
+  it('rejects partial, total, or pending recipient outcomes instead of reporting success', async () => {
+    const cases: Array<{
+      name: string;
+      accepted: string[];
+      rejected: string[];
+      pending: string[];
+    }> = [
+      {
+        name: 'partial acceptance',
+        accepted: ['recipient@example.invalid'],
+        rejected: ['second@example.invalid'],
+        pending: [],
+      },
+      {
+        name: 'total rejection',
+        accepted: [],
+        rejected: ['recipient@example.invalid'],
+        pending: [],
+      },
+      {
+        name: 'pending recipient',
+        accepted: [],
+        rejected: [],
+        pending: ['recipient@example.invalid'],
+      },
+    ];
+
+    for (const outcome of cases) {
+      const service = createEmailService(smtpConfig, () => ({
+        sendMail: vi.fn().mockResolvedValue({
+          ...sentMessageInfo,
+          accepted: outcome.accepted,
+          rejected: outcome.rejected,
+          pending: outcome.pending,
+        }),
+        verify: vi.fn().mockResolvedValue(true as const),
+      }));
+
+      await expect(
+        service.sendEmail('Administration', {
+          to: ['recipient@example.invalid', 'second@example.invalid'],
+          subject: 'Notice',
+          text: 'Body',
+        }),
+        outcome.name,
+      ).rejects.toMatchObject({
+        category: 'provider_rejection',
+        message: 'SMTP email delivery failed.',
+      });
+    }
+  });
+
+  it('categorizes and safely logs authentication and connection failures', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const failures = [
+        {
+          error: Object.assign(new Error('private smtp password and recipient details'), {
+            code: 'EAUTH',
+            command: 'AUTH',
+            responseCode: 535,
+          }),
+          category: 'authentication',
+        },
+        {
+          error: Object.assign(new Error('private connection details'), { code: 'ECONNECTION' }),
+          category: 'connection',
+        },
+        {
+          error: Object.assign(new Error('private provider response details'), {
+            responseCode: 550,
+          }),
+          category: 'provider_rejection',
+        },
+      ] as const;
+
+      for (const failure of failures) {
+        const service = createEmailService(smtpConfig, () => ({
+          sendMail: vi.fn().mockRejectedValue(failure.error),
+          verify: vi.fn().mockResolvedValue(true as const),
+        }));
+        const error = await service
+          .sendEmail('Administration', {
+            to: 'recipient@example.invalid',
+            subject: 'Sensitive subject',
+            text: 'Sensitive body',
+          })
+          .catch((caught: unknown) => caught);
+
+        expect(error).toBeInstanceOf(EmailServiceError);
+        expect(error).toMatchObject({
+          category: failure.category,
+          message: 'SMTP email delivery failed.',
+        });
+      }
+
+      expect(warn).toHaveBeenNthCalledWith(
+        1,
+        { emailOperation: 'send', emailErrorCategory: 'authentication' },
+        'Email operation failed',
+      );
+      expect(warn).toHaveBeenNthCalledWith(
+        2,
+        { emailOperation: 'send', emailErrorCategory: 'connection' },
+        'Email operation failed',
+      );
+      expect(warn).toHaveBeenNthCalledWith(
+        3,
+        { emailOperation: 'send', emailErrorCategory: 'provider_rejection' },
+        'Email operation failed',
+      );
+
+      const configurationService = createEmailService({
+        EMAIL_FROM_ADMINISTRATION: senderAddresses.Administration,
+      });
+      const configurationError = await configurationService
+        .sendEmail('Administration', {
+          to: 'recipient@example.invalid',
+          subject: 'Notice',
+          text: 'Body',
+        })
+        .catch((caught: unknown) => caught);
+
+      expect(configurationError).toBeInstanceOf(EmailServiceError);
+      expect(configurationError).toMatchObject({ category: 'configuration' });
+      expect(warn).toHaveBeenNthCalledWith(
+        4,
+        { emailOperation: 'send', emailErrorCategory: 'configuration' },
+        'Email operation failed',
+      );
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('private');
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('recipient@example.invalid');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it.each(Object.keys(EMAIL_SENDER_CONFIG_KEYS) as EmailDepartment[])(

@@ -44,7 +44,7 @@ const auth: AuthContext = {
 const smtpResult: SMTPTransport.SentMessageInfo = {
   envelope: { from: 'sales@example.invalid', to: ['recipient@example.invalid'] },
   messageId: 'test-message-id',
-  accepted: ['recipient@example.invalid'],
+  accepted: ['recipient@example.invalid', 'copy@example.invalid', 'private@example.invalid'],
   rejected: [],
   pending: [],
   response: '250 accepted',
@@ -127,6 +127,67 @@ describe('POST /api/v1/email/send', () => {
         ],
       }),
     );
+  });
+
+  it('returns the existing safe failure response when SMTP partially rejects recipients', async () => {
+    sendEmail.mockResolvedValue({
+      ...smtpResult,
+      accepted: ['recipient@example.invalid'],
+      rejected: ['copy@example.invalid'],
+    });
+
+    const response = await request(testApp({ sendEmail })).post('/api/v1/email/send').send({
+      to: 'recipient@example.invalid',
+      cc: 'copy@example.invalid',
+      subject: 'Subject',
+      text: 'Body',
+    });
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      error: { message: 'Email could not be sent. Please try again later.' },
+    });
+    expect(JSON.stringify(response.body)).not.toContain('recipient@example.invalid');
+    expect(JSON.stringify(response.body)).not.toContain('copy@example.invalid');
+  });
+
+  it('does not report success when SMTP rejects every recipient', async () => {
+    sendEmail.mockResolvedValue({
+      ...smtpResult,
+      accepted: [],
+      rejected: ['recipient@example.invalid'],
+    });
+
+    const response = await request(testApp({ sendEmail })).post('/api/v1/email/send').send({
+      to: 'recipient@example.invalid',
+      subject: 'Subject',
+      text: 'Body',
+    });
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      error: { message: 'Email could not be sent. Please try again later.' },
+    });
+    expect(JSON.stringify(response.body)).not.toContain('recipient@example.invalid');
+  });
+
+  it('does not report success when SMTP leaves a recipient pending', async () => {
+    sendEmail.mockResolvedValue({
+      ...smtpResult,
+      accepted: [],
+      pending: ['recipient@example.invalid'],
+    });
+
+    const response = await request(testApp({ sendEmail })).post('/api/v1/email/send').send({
+      to: 'recipient@example.invalid',
+      subject: 'Subject',
+      text: 'Body',
+    });
+
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      error: { message: 'Email could not be sent. Please try again later.' },
+    });
   });
 
   it('rejects invalid recipients and missing subject or message content', async () => {
