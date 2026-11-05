@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { EmailServiceError, verifySmtpConnection } from '../src/core/email/email-service';
 
 export async function runEmailVerify(
@@ -14,7 +15,8 @@ export async function runEmailVerify(
   }
 }
 
-if (require.main === module) {
+const invokedScript = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
+if (invokedScript === path.resolve(process.cwd(), 'scripts', 'email-verify.ts')) {
   void runEmailVerify().then((exitCode) => {
     process.exitCode = exitCode;
   });

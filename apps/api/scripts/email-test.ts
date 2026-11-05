@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { emailAddressSchema, EmailServiceError, sendEmail } from '../src/core/email/email-service';
 
 export async function runEmailTest(
@@ -24,7 +25,8 @@ export async function runEmailTest(
   }
 }
 
-if (require.main === module) {
+const invokedScript = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
+if (invokedScript === path.resolve(process.cwd(), 'scripts', 'email-test.ts')) {
   void runEmailTest(process.argv.slice(2)).then((exitCode) => {
     process.exitCode = exitCode;
   });
