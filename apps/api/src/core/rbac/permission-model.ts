@@ -26,6 +26,7 @@ export const PERMISSION_ROLES = ['ADMIN', 'MANAGER', 'LEAD', 'MEMBER'] as const;
 export type PermissionRole = (typeof PERMISSION_ROLES)[number];
 
 export const DEFAULT_RESOURCE = '*';
+export const EMAIL_SEND_PERMISSION = 'email.send';
 export const familyResource = (family: string): string => `family:${family}`;
 export const pageResource = (pageId: string): string => `page:${pageId}`;
 
