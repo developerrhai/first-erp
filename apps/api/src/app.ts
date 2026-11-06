@@ -25,6 +25,7 @@ import { createUsersRouter } from './modules/users/routes';
 import { createAuditLogsRouter } from './modules/audit-logs/routes';
 import { createDepartmentAccessRouter } from './modules/department-access/routes';
 import { createDepartmentsRouter } from './modules/departments/routes';
+import { createEmailRouter } from './modules/email/routes';
 import { createMeRouter } from './modules/me/routes';
 import { createModuleControlsRouter } from './modules/module-controls/routes';
 import { createPermissionsRouter } from './modules/permissions/routes';
@@ -86,11 +87,12 @@ export function createApp(options: AppOptions = {}): Express {
       exposedHeaders: ['X-Request-Id', 'Retry-After', 'ETag'],
     }),
   );
-  app.use(express.json({ limit: '100kb' }));
   app.use(cookieParser());
+  app.use('/api/v1', createGlobalLimiter(rateLimitEnabled));
+  app.use('/api/v1/email', createEmailRouter());
+  app.use(express.json({ limit: '100kb' }));
 
   const api = express.Router();
-  api.use(createGlobalLimiter(rateLimitEnabled));
   api.use('/health', createHealthRouter(options.dbPing));
   api.use(
     '/auth',

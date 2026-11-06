@@ -1,10 +1,16 @@
 // Reads and validates every environment variable once, so a misconfigured server fails fast at boot
 // instead of misbehaving later. Everything else imports the typed `env` object from here.
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
-dotenv.config({ path: path.resolve(__dirname, '../../.env') });
+const envFilePath = [
+  path.resolve(process.cwd(), 'apps', 'api', '.env'),
+  path.resolve(process.cwd(), '.env'),
+].find(existsSync);
+
+if (envFilePath) dotenv.config({ path: envFilePath });
 
 const DURATION = /^(\d+)(s|m|h)$/;
 const UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600 };
@@ -58,6 +64,51 @@ const booleanString = z
   .default('false')
   .transform((v) => v === 'true');
 
+export const EMAIL_SENDER_CONFIG_KEYS = {
+  Administration: 'EMAIL_FROM_ADMINISTRATION',
+  Sales: 'EMAIL_FROM_SALES',
+  Purchase: 'EMAIL_FROM_PURCHASE',
+  Finance: 'EMAIL_FROM_FINANCE',
+  HR: 'EMAIL_FROM_HR',
+  Production: 'EMAIL_FROM_PRODUCTION',
+  Quality: 'EMAIL_FROM_QUALITY',
+  Maintenance: 'EMAIL_FROM_MAINTENANCE',
+  Warehouse: 'EMAIL_FROM_WAREHOUSE',
+  Projects: 'EMAIL_FROM_PROJECTS',
+  Service: 'EMAIL_FROM_SERVICE',
+} as const;
+
+export type EmailDepartment = keyof typeof EMAIL_SENDER_CONFIG_KEYS;
+type EmailSenderConfigKey = (typeof EMAIL_SENDER_CONFIG_KEYS)[EmailDepartment];
+
+export function isValidSmtpHost(host: string): boolean {
+  try {
+    const parsed = new URL(`smtp://${host}`);
+    return (
+      !/[/?#@]/.test(host) &&
+      !host.includes('://') &&
+      parsed.hostname.length > 0 &&
+      parsed.username === '' &&
+      parsed.password === '' &&
+      parsed.port === '' &&
+      (parsed.pathname === '' || parsed.pathname === '/') &&
+      parsed.search === '' &&
+      parsed.hash === ''
+    );
+  } catch {
+    return false;
+  }
+}
+
+const smtpHostSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine(
+    isValidSmtpHost,
+    'SMTP_HOST must be a hostname only, without protocol, port, credentials, or path',
+  );
+
 const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -89,6 +140,26 @@ const envSchema = z
     TRUST_PROXY: z.string().trim().min(1).default('loopback'),
     /** Max Argon2 hash/verify operations in flight; beyond that requests get 503 SERVER_BUSY. */
     ARGON2_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(256).default(8),
+    SMTP_HOST: smtpHostSchema.optional(),
+    SMTP_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+    SMTP_SECURE: z
+      .enum(['true', 'false'])
+      .optional()
+      .transform((v) => (v === undefined ? undefined : v === 'true')),
+    SMTP_AUTH_METHOD: z.enum(['password', 'none']).optional(),
+    SMTP_USER: z.string().trim().min(1).optional(),
+    SMTP_PASSWORD: z.string().min(1).optional(),
+    EMAIL_FROM_ADMINISTRATION: z.string().trim().email().optional(),
+    EMAIL_FROM_SALES: z.string().trim().email().optional(),
+    EMAIL_FROM_PURCHASE: z.string().trim().email().optional(),
+    EMAIL_FROM_FINANCE: z.string().trim().email().optional(),
+    EMAIL_FROM_HR: z.string().trim().email().optional(),
+    EMAIL_FROM_PRODUCTION: z.string().trim().email().optional(),
+    EMAIL_FROM_QUALITY: z.string().trim().email().optional(),
+    EMAIL_FROM_MAINTENANCE: z.string().trim().email().optional(),
+    EMAIL_FROM_WAREHOUSE: z.string().trim().email().optional(),
+    EMAIL_FROM_PROJECTS: z.string().trim().email().optional(),
+    EMAIL_FROM_SERVICE: z.string().trim().email().optional(),
   })
   .superRefine((value, ctx) => {
     for (const key of ['WEB_ORIGINS', 'CORS_ORIGINS', 'WEB_ORIGIN'] as const) {
@@ -113,6 +184,61 @@ const envSchema = z
         code: z.ZodIssueCode.custom,
         path: ['RATE_LIMIT_DISABLED'],
         message: 'RATE_LIMIT_DISABLED=true is only allowed when NODE_ENV=test',
+      });
+    }
+    const senderKeys = Object.values(EMAIL_SENDER_CONFIG_KEYS) as EmailSenderConfigKey[];
+    const senderConfigured = senderKeys.some((key) => value[key] !== undefined);
+    const smtpConfigured = [
+      value.SMTP_HOST,
+      value.SMTP_PORT,
+      value.SMTP_SECURE,
+      value.SMTP_AUTH_METHOD,
+      value.SMTP_USER,
+      value.SMTP_PASSWORD,
+      ...senderKeys.map((key) => value[key]),
+    ].some((setting) => setting !== undefined);
+    if (smtpConfigured && !value.SMTP_HOST) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SMTP_HOST'],
+        message: 'SMTP_HOST is required when SMTP email settings are provided',
+      });
+    }
+    if (smtpConfigured && !senderConfigured) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['EMAIL_FROM_ADMINISTRATION'],
+        message: 'At least one department EMAIL_FROM_* sender is required when SMTP is configured',
+      });
+    }
+    if ((value.SMTP_USER === undefined) !== (value.SMTP_PASSWORD === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SMTP_USER'],
+        message: 'SMTP_USER and SMTP_PASSWORD must be provided together',
+      });
+    }
+    const hasCredentials = value.SMTP_USER !== undefined && value.SMTP_PASSWORD !== undefined;
+    if (smtpConfigured && !hasCredentials && value.SMTP_AUTH_METHOD !== 'none') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SMTP_AUTH_METHOD'],
+        message:
+          'Set SMTP_AUTH_METHOD=none only when the approved relay requires no authentication',
+      });
+    }
+    if (value.SMTP_AUTH_METHOD === 'password' && !hasCredentials) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SMTP_AUTH_METHOD'],
+        message: 'SMTP_AUTH_METHOD=password requires SMTP_USER and SMTP_PASSWORD',
+      });
+    }
+    if (value.SMTP_AUTH_METHOD === 'none' && (value.SMTP_USER || value.SMTP_PASSWORD)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SMTP_AUTH_METHOD'],
+        message: 'SMTP_AUTH_METHOD=none cannot be combined with SMTP credentials',
       });
     }
   })

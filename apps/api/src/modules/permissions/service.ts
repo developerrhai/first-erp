@@ -11,6 +11,7 @@ import { invalidateAccessCache } from '../../core/rbac/access';
 import {
   ACTIONS,
   DEFAULT_RESOURCE,
+  EMAIL_SEND_PERMISSION,
   PERMISSION_ROLES,
   familyResource,
   isPermissionRole,
@@ -48,6 +49,7 @@ export interface RolePermissionsDto {
 /** "*" first, then families in registry order, then pages in menu order. */
 function resourceOrder(resource: string): number {
   if (resource === DEFAULT_RESOURCE) return -1;
+  if (resource === EMAIL_SEND_PERMISSION) return 999;
   if (resource.startsWith('family:')) {
     const index = registry.familyNames.indexOf(resource.slice('family:'.length));
     return index < 0 ? 10_000 : index;
@@ -85,7 +87,7 @@ function roleDto(
   };
 }
 
-function validateRows(role: PermissionRole, rows: PermissionRowInput[]): void {
+export function validateRows(role: PermissionRole, rows: PermissionRowInput[]): void {
   const fields: Record<string, string> = {};
   const seen = new Set<string>();
   rows.forEach((row, i) => {
@@ -93,6 +95,16 @@ function validateRows(role: PermissionRole, rows: PermissionRowInput[]): void {
     if (seen.has(row.resource)) fields[key] = 'Duplicate resource.';
     seen.add(row.resource);
     if (row.resource === DEFAULT_RESOURCE) return;
+    if (row.resource === EMAIL_SEND_PERMISSION) {
+      if (row.add === null) fields[`rows.${i}.add`] = 'Set the email.send permission explicitly.';
+      for (const action of ACTIONS) {
+        if (action !== 'add' && row[action] !== false) {
+          fields[`rows.${i}.${action}`] = 'The email.send resource only supports add.';
+        }
+      }
+      if (row.scope !== null) fields[`rows.${i}.scope`] = 'The email.send resource has no scope.';
+      return;
+    }
     if (row.resource.startsWith('family:')) {
       if (!isFamily(row.resource.slice('family:'.length))) fields[key] = 'Unknown family.';
       return;
@@ -101,7 +113,7 @@ function validateRows(role: PermissionRole, rows: PermissionRowInput[]): void {
       if (!pageInfo(row.resource.slice('page:'.length))) fields[key] = 'Unknown page.';
       return;
     }
-    fields[key] = 'Resource must be "*", "family:<name>" or "page:<id>".';
+    fields[key] = 'Resource must be "*", "family:<name>", "page:<id>", or "email.send".';
   });
   if (!seen.has(DEFAULT_RESOURCE)) fields.rows = 'A "*" (role default) row is required.';
   rows.forEach((row, i) => {

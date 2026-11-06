@@ -1,5 +1,5 @@
 // Zod schemas for PUT /permissions/:role. Rows are strict; cells may be null (inherit) except on
-// "*". Resource format and existence (registry families/pages, exactly one "*") are checked in the service.
+// "*". Resource format and existence are checked in the service, including the dedicated email.send resource.
 import { z } from 'zod';
 import { SCOPES } from '../../core/rbac/permission-model';
 import { ROLES } from '../../core/rbac/role-rules';
